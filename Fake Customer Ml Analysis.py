@@ -1,17 +1,27 @@
+# ===========================================
+# 📊 Fake Customer Data Analysis Pipeline
+# ===========================================
+
+# 🛠️ STEP 1: Import Required Libraries
 import pandas as pd
 import random
 from faker import Faker
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.ensemble import GradientBoostingClassifier, StackingClassifier
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.experimental import enable_halving_search_cv
+from sklearn.model_selection import HalvingRandomSearchCV
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 import xgboost as xgb
 from catboost import CatBoostClassifier
+import shap
 import joblib
-from sklearn.model_selection import StratifiedKFold
 
-# Step 1: Generate Fake Customer Data
+# ===========================================
+# 🛠️ STEP 2: Generate Fake Customer Data
+# ===========================================
+
 fake = Faker()
 Faker.seed(42)
 random.seed(42)
@@ -19,8 +29,10 @@ random.seed(42)
 # Predefined suburb list
 PREDEFINED_SUBURBS = ['North Sydney', 'East Melbourne', 'South Brisbane', 'West Perth', 'Central Adelaide']
 
-# Generate fake data with constrained suburbs and synthetic relationships
 def generate_fake_customers(n=1000):
+    """
+    Generate fake customer data with synthetic relationships.
+    """
     data = []
     for _ in range(n):
         gender = random.choice(['Male', 'Female'])
@@ -40,113 +52,149 @@ def generate_fake_customers(n=1000):
         })
     return pd.DataFrame(data)
 
-# Generate initial dataset
+# Generate Dataset
 customer_data = generate_fake_customers(1000)
 print(customer_data.head())
 
-# Step 2: Prepare Data for Machine Learning
-customer_data['dob'] = pd.to_datetime(customer_data['dob'])
-customer_data['dob_year'] = customer_data['dob'].dt.year
-customer_data = customer_data.drop(['dob'], axis=1)
+# ===========================================
+# 📊 STEP 3: Prepare Data for Analysis
+# ===========================================
 
-# Encode categorical variables
-label_encoders = {}
-for col in ['first_name', 'last_name', 'suburb', 'gender', 'income_bracket']:
-    le = LabelEncoder()
-    customer_data[col] = le.fit_transform(customer_data[col])
-    label_encoders[col] = le
+# Feature Engineering and Preprocessing
+def prepare_data(df):
+    """
+    Prepare data for machine learning, including encoding and scaling.
+    """
+    df['dob'] = pd.to_datetime(df['dob'])
+    df['dob_year'] = df['dob'].dt.year
+    df.drop(['dob'], axis=1, inplace=True)
 
-# Define Features and Labels
-X = customer_data.drop('suburb', axis=1)
-y = customer_data['suburb']
+    # Encode categorical variables
+    label_encoders = {}
+    for col in ['first_name', 'last_name', 'suburb', 'gender', 'income_bracket']:
+        le = LabelEncoder()
+        df[col] = le.fit_transform(df[col])
+        label_encoders[col] = le
 
-# Split dataset into training and validation sets
+    # Define Features and Labels
+    X = df.drop('suburb', axis=1)
+    y = df['suburb']
+
+    # Feature Scaling
+    scaler = StandardScaler()
+    X[['dob_year']] = scaler.fit_transform(X[['dob_year']])
+
+    # Feature Engineering
+    X['gender_income'] = X['gender'] * X['income_bracket']
+
+    return X, y, label_encoders
+
+X, y, label_encoders = prepare_data(customer_data)
 X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Step 3: Hyperparameter Tuning with GridSearchCV
-param_grid = {
-    'n_estimators': [100, 200],
-    'learning_rate': [0.05, 0.1],
-    'max_depth': [3, 5]
+# ===========================================
+# 🧠 STEP 4: Build and Train Models
+# ===========================================
+
+def train_models(X_train, y_train):
+    """
+    Train multiple machine learning models and optimize them.
+    """
+    # Hyperparameter Tuning with HalvingRandomSearchCV
+    param_grid = {
+        'n_estimators': [100, 200],
+        'learning_rate': [0.05, 0.1],
+        'max_depth': [3, 5]
+    }
+    gb_clf = GradientBoostingClassifier(random_state=42)
+    halving_search = HalvingRandomSearchCV(estimator=gb_clf, param_distributions=param_grid,
+                                           factor=2, random_state=42, scoring='accuracy', verbose=2)
+    halving_search.fit(X_train, y_train)
+    best_gb_clf = halving_search.best_estimator_
+
+    # XGBoost Model
+    xgb_clf = xgb.XGBClassifier(eval_metric='mlogloss', random_state=42)
+    xgb_clf.fit(X_train, y_train)
+
+    # CatBoost Model
+    cat_clf = CatBoostClassifier(iterations=200, learning_rate=0.05, depth=5, verbose=0, random_state=42)
+    cat_clf.fit(X_train, y_train)
+
+    # Stacking Classifier
+    stacking_clf = StackingClassifier(
+        estimators=[('cat', cat_clf), ('gb', best_gb_clf)],
+        final_estimator=GradientBoostingClassifier(n_estimators=100, random_state=42),
+        n_jobs=-1
+    )
+    stacking_clf.fit(X_train, y_train)
+
+    return best_gb_clf, xgb_clf, cat_clf, stacking_clf
+
+gb_clf, xgb_clf, cat_clf, stacking_clf = train_models(X_train, y_train)
+
+# ===========================================
+# ⚙️ STEP 5: Evaluate Models
+# ===========================================
+
+def evaluate_models(models, X_valid, y_valid):
+    """
+    Evaluate models and display results.
+    """
+    model_results = {}
+    for name, model in models.items():
+        accuracy = accuracy_score(y_valid, model.predict(X_valid))
+        model_results[name] = accuracy
+
+    print(pd.DataFrame(model_results.items(), columns=['Model', 'Validation Accuracy']))
+
+    print("\nXGBoost Classification Report:")
+    print(classification_report(y_valid, models['XGBoost'].predict(X_valid)))
+    cm = confusion_matrix(y_valid, models['XGBoost'].predict(X_valid))
+    ConfusionMatrixDisplay(cm).plot(cmap='Blues')
+    plt.title('Confusion Matrix - XGBoost')
+    plt.show()
+
+models = {
+    'Gradient Boosting': gb_clf,
+    'XGBoost': xgb_clf,
+    'CatBoost': cat_clf,
+    'Stacking Classifier': stacking_clf
 }
-gb_clf = GradientBoostingClassifier(random_state=42)
-grid_search = GridSearchCV(estimator=gb_clf, param_grid=param_grid, cv=5, scoring='accuracy', verbose=2)
-grid_search.fit(X_train, y_train)
-print("Best Parameters:", grid_search.best_params_)
-clf = grid_search.best_estimator_
 
-# Step 4: Alternative Model - XGBoost
-xgb_clf = xgb.XGBClassifier(eval_metric='mlogloss', random_state=42)
-xgb_clf.fit(X_train, y_train)
+evaluate_models(models, X_valid, y_valid)
 
-# Step 5: Advanced Model - CatBoost
-cat_clf = CatBoostClassifier(iterations=200, learning_rate=0.05, depth=5, verbose=0, random_state=42)
-cat_clf.fit(X_train, y_train)
+# ===========================================
+# 🧠 STEP 6: Explain Predictions with SHAP
+# ===========================================
 
-# Step 6: Optimized Stacking Classifier
-estimators = [
-    ('cat', cat_clf),
-    ('gb', clf)
-]
-stacking_clf = StackingClassifier(
-    estimators=estimators,
-    final_estimator=GradientBoostingClassifier(n_estimators=100, random_state=42),
-    n_jobs=-1
-)
-stacking_clf.fit(X_train, y_train)
+# SHAP Model Explainability
+explainer = shap.Explainer(xgb_clf, X_train, feature_names=X.columns)
+shap_values = explainer(X_valid)
 
-# Evaluate Models on Validation Set
-print("Gradient Boosting Validation Accuracy:", accuracy_score(y_valid, clf.predict(X_valid)))
-print("XGBoost Validation Accuracy:", accuracy_score(y_valid, xgb_clf.predict(X_valid)))
-print("CatBoost Validation Accuracy:", accuracy_score(y_valid, cat_clf.predict(X_valid)))
-print("Stacking Classifier Validation Accuracy:", accuracy_score(y_valid, stacking_clf.predict(X_valid)))
+# Ensure valid DataFrame for SHAP
+X_valid_df = pd.DataFrame(X_valid, columns=X.columns)
 
-# Cross-Validation Scores
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-cv_scores = []
+# Generate SHAP Summary Plot
+shap.summary_plot(shap_values, X_valid_df, plot_type='dot')
 
-for train_idx, test_idx in cv.split(X, y):
-    X_train_cv, X_test_cv = X.iloc[train_idx], X.iloc[test_idx]
-    y_train_cv, y_test_cv = y.iloc[train_idx], y.iloc[test_idx]
-    xgb_clf.fit(X_train_cv, y_train_cv)
-    accuracy = accuracy_score(y_test_cv, xgb_clf.predict(X_test_cv))
-    cv_scores.append(accuracy)
+# ===========================================
+# 💾 STEP 7: Save Models
+# ===========================================
 
-print("XGBoost Cross-Validation Accuracy:", sum(cv_scores) / len(cv_scores))
+joblib.dump(gb_clf, 'gradient_boosting_model.pkl')
+joblib.dump(xgb_clf, 'xgboost_model.pkl')
+joblib.dump(cat_clf, 'catboost_model.pkl')
+joblib.dump(stacking_clf, 'stacking_model.pkl')
 
-# Step 7: Predict Next 1000 Customers with XGBoost
-def predict_new_customers(n=1000, model=xgb_clf):
-    new_customers = []
-    for _ in range(n):
-        new_customer = {
-            'first_name': random.choice(customer_data['first_name'].unique()),
-            'last_name': random.choice(customer_data['last_name'].unique()),
-            'gender': random.choice(customer_data['gender'].unique()),
-            'income_bracket': random.choice(customer_data['income_bracket'].unique()),
-            'dob_year': random.randint(1930, 2005)
-        }
-        new_customers.append(new_customer)
-    new_customers_df = pd.DataFrame(new_customers)
-    predicted_suburbs = model.predict(new_customers_df)
-    new_customers_df['suburb'] = label_encoders['suburb'].inverse_transform(predicted_suburbs)
-    return new_customers_df
+# ===========================================
+# 📊 STEP 8: Visualize Feature Importance
+# ===========================================
 
-# Generate and display new customers
-new_customers = predict_new_customers(model=xgb_clf)
-print(new_customers.head())
-
-# Save the best model
-joblib.dump(xgb_clf, 'xgboost_best_model.pkl')
-
-# Additional Insights
-print("Feature Importances:")
-importances = pd.DataFrame({'Feature': X.columns, 'Importance': xgb_clf.feature_importances_})
-importances = importances.sort_values(by='Importance', ascending=False)
-print(importances)
-
-# Visualize Feature Importances
+importances = pd.DataFrame({'Feature': X.columns, 'Importance': xgb_clf.feature_importances_}).sort_values(by='Importance', ascending=False)
 plt.figure(figsize=(12, 8))
 plt.barh(importances['Feature'], importances['Importance'])
+for index, value in enumerate(importances['Importance']):
+    plt.text(value, index, f"{value:.2f}")
 plt.xlabel('Importance')
 plt.ylabel('Features')
 plt.title('Feature Importances from XGBoost Classifier')
